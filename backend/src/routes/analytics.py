@@ -7,7 +7,6 @@ from collections import defaultdict
 from src.models.user import db
 from src.models.invoice import Product, Supplier, PriceHistory, Invoice, InvoiceLine
 
-
 analytics_bp = Blueprint('analytics', __name__)
 
 @analytics_bp.route('/price-evolution/<int:product_id>', methods=['GET'])
@@ -43,7 +42,8 @@ def get_price_evolution(product_id):
             'date': price.date.isoformat(),
             'unit_price': price.unit_price,
             'supplier_id': price.supplier_id,
-            'supplier_name': price.supplier.name if price.supplier else 'Inconnu'
+            'supplier_name': price.supplier.name if price.supplier else 'Inconnu',
+            'quantity': price.quantity
         })
     
     # Calculer les moyennes par période
@@ -52,276 +52,194 @@ def get_price_evolution(product_id):
         avg_price = statistics.mean([p['unit_price'] for p in prices])
         min_price = min([p['unit_price'] for p in prices])
         max_price = max([p['unit_price'] for p in prices])
+        total_quantity = sum([p['quantity'] for p in prices])
         
         evolution_data.append({
             'period': period,
             'average_price': round(avg_price, 2),
             'min_price': round(min_price, 2),
             'max_price': round(max_price, 2),
-            'data_points': len(prices),
+            'total_quantity': round(total_quantity, 2),
+            'transactions_count': len(prices),
             'suppliers': list(set([p['supplier_name'] for p in prices]))
         })
     
-    # Calculer les variations
-    for i in range(1, len(evolution_data)):
-        prev_price = evolution_data[i-1]['average_price']
-        curr_price = evolution_data[i]['average_price']
-        variation = ((curr_price - prev_price) / prev_price) * 100 if prev_price > 0 else 0
-        evolution_data[i]['variation_percent'] = round(variation, 2)
-        evolution_data[i]['is_significant'] = abs(variation) > 15  # Seuil de variation significative
+    # Calculer la volatilité
+    if len(evolution_data) > 1:
+        first_price = evolution_data[0]['average_price']
+        last_price = evolution_data[-1]['average_price']
+        volatility = round(((last_price - first_price) / first_price) * 100, 1)
+    else:
+        volatility = 0
     
+    # Obtenir les infos du produit
     product = Product.query.get(product_id)
     
     return jsonify({
-        'product': product.to_dict() if product else None,
-        'granularity': granularity,
+        'product': {
+            'id': product.id,
+            'name': product.name,
+            'category': product.category,
+            'unit': product.unit
+        },
         'evolution': evolution_data,
-        'total_data_points': len(price_data)
+        'volatility_percentage': volatility,
+        'total_data_points': len(price_data),
+        'date_range': {
+            'start': price_data[0].date.isoformat(),
+            'end': price_data[-1].date.isoformat()
+        }
     })
 
-@analytics_bp.route('/price-volatility', methods=['GET'])
-def get_price_volatility():
-    """Analyse de volatilité des prix par produit"""
-    limit = request.args.get('limit', 20, type=int)
+@analytics_bp.route('/products-summary', methods=['GET'])
+def get_products_summary():
+    """Récupère un résumé de tous les produits avec leurs données de prix"""
+    products = db.session.query(Product).all()
     
-    # Récupérer tous les produits avec leurs prix
-    products_volatility = []
-    
-    products = Product.query.all()
-    
+    products_summary = []
     for product in products:
-        prices = [ph.unit_price for ph in product.price_history if ph.unit_price > 0]
+        # Obtenir les données de prix pour ce produit
+        price_history = db.session.query(PriceHistory)\
+            .filter(PriceHistory.product_id == product.id)\
+            .order_by(PriceHistory.date.asc()).all()
         
-        if len(prices) < 2:
-            continue
-        
-        # Calculs statistiques
-        mean_price = statistics.mean(prices)
-        std_dev = statistics.stdev(prices) if len(prices) > 1 else 0
-        coefficient_variation = (std_dev / mean_price) * 100 if mean_price > 0 else 0
-        min_price = min(prices)
-        max_price = max(prices)
-        price_range = max_price - min_price
-        
-        # Nombre de fournisseurs différents
-        suppliers_count = len(set([ph.supplier_id for ph in product.price_history]))
-        
-        # Dernière mise à jour
-        last_price_date = max([ph.date for ph in product.price_history])
-        
-        products_volatility.append({
-            'product': product.to_dict(),
-            'statistics': {
-                'mean_price': round(mean_price, 2),
-                'std_deviation': round(std_dev, 2),
-                'coefficient_variation': round(coefficient_variation, 2),
-                'min_price': round(min_price, 2),
-                'max_price': round(max_price, 2),
-                'price_range': round(price_range, 2),
-                'data_points': len(prices),
-                'suppliers_count': suppliers_count,
-                'last_update': last_price_date.isoformat()
-            },
-            'volatility_level': 'high' if coefficient_variation > 20 else 'medium' if coefficient_variation > 10 else 'low'
-        })
+        if price_history:
+            prices = [p.unit_price for p in price_history]
+            latest_price = price_history[-1].unit_price
+            first_price = price_history[0].unit_price
+            
+            # Calculer la volatilité
+            volatility = ((latest_price - first_price) / first_price) * 100 if first_price > 0 else 0
+            
+            # Déterminer la tendance
+            if len(price_history) >= 2:
+                recent_prices = prices[-3:] if len(prices) >= 3 else prices
+                if len(recent_prices) >= 2:
+                    trend_slope = (recent_prices[-1] - recent_prices[0]) / len(recent_prices)
+                    if trend_slope > 0.1:
+                        trend = 'hausse'
+                    elif trend_slope < -0.1:
+                        trend = 'baisse'
+                    else:
+                        trend = 'stable'
+                else:
+                    trend = 'stable'
+            else:
+                trend = 'stable'
+            
+            # Obtenir les fournisseurs uniques
+            suppliers = list(set([p.supplier.name for p in price_history if p.supplier]))
+            
+            products_summary.append({
+                'id': product.id,
+                'name': product.name,
+                'category': product.category,
+                'unit': product.unit,
+                'latest_price': round(latest_price, 2),
+                'volatility_percentage': round(volatility, 1),
+                'trend': trend,
+                'price_data_points': len(price_history),
+                'suppliers': suppliers,
+                'price_range': {
+                    'min': round(min(prices), 2),
+                    'max': round(max(prices), 2)
+                }
+            })
     
-    # Trier par coefficient de variation (plus volatil en premier)
-    products_volatility.sort(key=lambda x: x['statistics']['coefficient_variation'], reverse=True)
-    
-    return jsonify({
-        'products': products_volatility[:limit],
-        'total_products': len(products_volatility)
-    })
+    return jsonify(products_summary)
 
 @analytics_bp.route('/supplier-comparison/<int:product_id>', methods=['GET'])
 def get_supplier_comparison(product_id):
     """Compare les prix d'un produit entre différents fournisseurs"""
+    price_data = db.session.query(PriceHistory)\
+        .filter(PriceHistory.product_id == product_id)\
+        .join(Supplier)\
+        .all()
     
-    # Récupérer les données de prix par fournisseur
-    suppliers_data = db.session.query(
-        Supplier.id,
-        Supplier.name,
-        func.avg(PriceHistory.unit_price).label('avg_price'),
-        func.min(PriceHistory.unit_price).label('min_price'),
-        func.max(PriceHistory.unit_price).label('max_price'),
-        func.count(PriceHistory.id).label('data_points'),
-        func.max(PriceHistory.date).label('last_update')
-    ).join(PriceHistory).filter(
-        PriceHistory.product_id == product_id
-    ).group_by(Supplier.id, Supplier.name).all()
+    if not price_data:
+        return jsonify({'error': 'Aucune donnée trouvée'}), 404
     
-    if not suppliers_data:
-        return jsonify({'error': 'Aucune donnée trouvée pour ce produit'}), 404
+    # Grouper par fournisseur
+    supplier_data = defaultdict(list)
+    for price in price_data:
+        supplier_data[price.supplier.name].append(price)
     
-    comparison_data = []
-    for supplier in suppliers_data:
-        # Calculer l'évolution récente (3 derniers mois)
-        recent_prices = db.session.query(PriceHistory.unit_price).filter(
-            PriceHistory.product_id == product_id,
-            PriceHistory.supplier_id == supplier.id,
-            PriceHistory.date >= datetime.now().date() - timedelta(days=90)
-        ).order_by(PriceHistory.date.desc()).limit(5).all()
+    comparison = []
+    for supplier_name, prices in supplier_data.items():
+        unit_prices = [p.unit_price for p in prices]
+        quantities = [p.quantity for p in prices]
         
-        recent_trend = 'stable'
-        if len(recent_prices) >= 2:
-            first_price = recent_prices[-1][0]
-            last_price = recent_prices[0][0]
-            variation = ((last_price - first_price) / first_price) * 100 if first_price > 0 else 0
-            
-            if variation > 5:
-                recent_trend = 'increasing'
-            elif variation < -5:
-                recent_trend = 'decreasing'
-        
-        comparison_data.append({
-            'supplier': {
-                'id': supplier.id,
-                'name': supplier.name
-            },
-            'pricing': {
-                'average_price': round(float(supplier.avg_price), 2),
-                'min_price': round(float(supplier.min_price), 2),
-                'max_price': round(float(supplier.max_price), 2),
-                'data_points': supplier.data_points,
-                'last_update': supplier.last_update.isoformat()
-            },
-            'recent_trend': recent_trend
+        comparison.append({
+            'supplier_name': supplier_name,
+            'average_price': round(statistics.mean(unit_prices), 2),
+            'min_price': round(min(unit_prices), 2),
+            'max_price': round(max(unit_prices), 2),
+            'total_orders': len(prices),
+            'total_quantity': round(sum(quantities), 2),
+            'last_order_date': max([p.date for p in prices]).isoformat(),
+            'price_stability': round(statistics.stdev(unit_prices) if len(unit_prices) > 1 else 0, 2)
         })
     
     # Trier par prix moyen
-    comparison_data.sort(key=lambda x: x['pricing']['average_price'])
-    
-    # Identifier le meilleur fournisseur (prix le plus bas)
-    if comparison_data:
-        comparison_data[0]['is_best_price'] = True
-    
-    product = Product.query.get(product_id)
+    comparison.sort(key=lambda x: x['average_price'])
     
     return jsonify({
-        'product': product.to_dict() if product else None,
-        'suppliers_comparison': comparison_data,
-        'total_suppliers': len(comparison_data)
+        'product_id': product_id,
+        'suppliers_comparison': comparison
     })
 
-@analytics_bp.route('/dashboard-kpis', methods=['GET'])
-def get_dashboard_kpis():
-    """Récupère les KPIs pour le dashboard principal"""
+@analytics_bp.route('/volatility-report', methods=['GET'])
+def get_volatility_report():
+    """Génère un rapport de volatilité pour tous les produits"""
+    days = request.args.get('days', 90, type=int)  # Par défaut 90 jours
     
-    # Nombre total de factures
-    total_invoices = Invoice.query.count()
+    cutoff_date = datetime.now().date() - timedelta(days=days)
     
-    # Nombre de produits uniques
-    total_products = Product.query.count()
+    # Obtenir tous les produits avec des données de prix récentes
+    products_with_recent_prices = db.session.query(Product)\
+        .join(PriceHistory)\
+        .filter(PriceHistory.date >= cutoff_date)\
+        .distinct().all()
     
-    # Nombre de fournisseurs
-    total_suppliers = Supplier.query.count()
+    volatility_report = []
     
-    # Factures du mois en cours
-    current_month = datetime.now().replace(day=1)
-    monthly_invoices = Invoice.query.filter(Invoice.created_at >= current_month).count()
-    
-    # Top 5 des produits les plus volatils
-    volatile_products = []
-    products = Product.query.limit(50).all()  # Limiter pour les performances
-    
-    for product in products:
-        prices = [ph.unit_price for ph in product.price_history if ph.unit_price > 0]
-        if len(prices) >= 2:
-            mean_price = statistics.mean(prices)
-            std_dev = statistics.stdev(prices)
-            cv = (std_dev / mean_price) * 100 if mean_price > 0 else 0
-            
-            volatile_products.append({
-                'product': product.to_dict(),
-                'coefficient_variation': round(cv, 2)
-            })
-    
-    volatile_products.sort(key=lambda x: x['coefficient_variation'], reverse=True)
-    top_volatile = volatile_products[:5]
-    
-    # Évolution globale des prix (moyenne tous produits)
-    recent_prices = db.session.query(
-        func.date_trunc('month', PriceHistory.date).label('month'),
-        func.avg(PriceHistory.unit_price).label('avg_price')
-    ).filter(
-        PriceHistory.date >= datetime.now().date() - timedelta(days=365)
-    ).group_by(
-        func.date_trunc('month', PriceHistory.date)
-    ).order_by('month').all()
-    
-    price_trend = []
-    for month_data in recent_prices:
-        price_trend.append({
-            'month': month_data.month.strftime('%Y-%m'),
-            'average_price': round(float(month_data.avg_price), 2)
-        })
-    
-    # Calcul de la variation globale
-    global_variation = 0
-    if len(price_trend) >= 2:
-        first_avg = price_trend[0]['average_price']
-        last_avg = price_trend[-1]['average_price']
-        global_variation = ((last_avg - first_avg) / first_avg) * 100 if first_avg > 0 else 0
-    
-    return jsonify({
-        'kpis': {
-            'total_invoices': total_invoices,
-            'total_products': total_products,
-            'total_suppliers': total_suppliers,
-            'monthly_invoices': monthly_invoices,
-            'global_price_variation': round(global_variation, 2)
-        },
-        'top_volatile_products': top_volatile,
-        'price_trend': price_trend
-    })
-
-@analytics_bp.route('/price-alerts', methods=['GET'])
-def get_price_alerts():
-    """Détecte les alertes de variation de prix significatives"""
-    threshold = request.args.get('threshold', 15, type=float)  # Seuil en pourcentage
-    days_back = request.args.get('days', 30, type=int)  # Période d'analyse
-    
-    alerts = []
-    cutoff_date = datetime.now().date() - timedelta(days=days_back)
-    
-    # Récupérer les produits avec des prix récents
-    products_with_recent_prices = db.session.query(Product.id).join(PriceHistory).filter(
-        PriceHistory.date >= cutoff_date
-    ).distinct().all()
-    
-    for (product_id,) in products_with_recent_prices:
-        # Récupérer les 2 derniers prix pour ce produit
-        recent_prices = db.session.query(PriceHistory).filter(
-            PriceHistory.product_id == product_id,
-            PriceHistory.date >= cutoff_date
-        ).order_by(PriceHistory.date.desc()).limit(2).all()
+    for product in products_with_recent_prices:
+        recent_prices = db.session.query(PriceHistory)\
+            .filter(PriceHistory.product_id == product.id)\
+            .filter(PriceHistory.date >= cutoff_date)\
+            .order_by(PriceHistory.date.asc()).all()
         
         if len(recent_prices) >= 2:
-            latest_price = recent_prices[0]
-            previous_price = recent_prices[1]
+            prices = [p.unit_price for p in recent_prices]
             
-            variation = ((latest_price.unit_price - previous_price.unit_price) / previous_price.unit_price) * 100
+            # Calculer différentes métriques de volatilité
+            price_changes = []
+            for i in range(1, len(prices)):
+                change = ((prices[i] - prices[i-1]) / prices[i-1]) * 100
+                price_changes.append(change)
             
-            if abs(variation) >= threshold:
-                product = Product.query.get(product_id)
-                alerts.append({
-                    'product': product.to_dict(),
-                    'supplier': latest_price.supplier.to_dict(),
-                    'previous_price': round(previous_price.unit_price, 2),
-                    'current_price': round(latest_price.unit_price, 2),
-                    'variation_percent': round(variation, 2),
-                    'alert_type': 'increase' if variation > 0 else 'decrease',
-                    'severity': 'high' if abs(variation) > 25 else 'medium',
-                    'date': latest_price.date.isoformat()
-                })
+            volatility_report.append({
+                'product_id': product.id,
+                'product_name': product.name,
+                'category': product.category,
+                'unit': product.unit,
+                'period_start': recent_prices[0].date.isoformat(),
+                'period_end': recent_prices[-1].date.isoformat(),
+                'price_start': round(recent_prices[0].unit_price, 2),
+                'price_end': round(recent_prices[-1].unit_price, 2),
+                'total_change_percent': round(((recent_prices[-1].unit_price - recent_prices[0].unit_price) / recent_prices[0].unit_price) * 100, 2),
+                'volatility_score': round(statistics.stdev(price_changes) if price_changes else 0, 2),
+                'max_increase': round(max(price_changes) if price_changes else 0, 2),
+                'max_decrease': round(min(price_changes) if price_changes else 0, 2),
+                'data_points': len(recent_prices)
+            })
     
-    # Trier par variation absolue décroissante
-    alerts.sort(key=lambda x: abs(x['variation_percent']), reverse=True)
+    # Trier par score de volatilité décroissant
+    volatility_report.sort(key=lambda x: x['volatility_score'], reverse=True)
     
     return jsonify({
-        'alerts': alerts,
-        'threshold': threshold,
-        'period_days': days_back,
-        'total_alerts': len(alerts)
+        'report_period_days': days,
+        'generated_at': datetime.now().isoformat(),
+        'products_analyzed': len(volatility_report),
+        'volatility_data': volatility_report
     })
-
